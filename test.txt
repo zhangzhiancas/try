@@ -1,0 +1,413 @@
+1.计算ndvi，用的是地表反射率把，我看网上一些人用TOA呀
+2.我筛选影像时，用了研究res_plot_yjg，但筛选的有些影像可能可能不能完全覆盖研究区，这在后面chart统计时
+会不会有问题呀
+3.不连续是怎么回事，是不是说明缺少数据呀
+4.连续图的孤立点
+5.之前遇到GEE没有思路想法，是怎么办的，有没有一些学习案例啊
+
+
+这几天学习使用GEE，进行数据处理分析
+主要是使用哨兵2号数据计算（1）闫家岗农场不同地块2021年的NDVI均值曲线；（2）闫家岗农场2021年与近几年年NDVI均值曲线
+
+我了解到农作物长势过程主要是过程监测和实时监测两种方法。
+前者构建作物生长过程曲线，与多年平均或某一时期的作物生长曲线进行定性地对比。
+后者实时NDVI 遥感影像与多年平均或某一指定时期的遥感影像进行差值运算，并对差值图像进行分级，判断监测期内地块之间作物长势状况。
+
+后面来实现这两种监测方法。
+
+
+
+
+
+
+
+农作物长势过程监测，基于时间序列NDVI 遥感影像，统计监测区域内耕地NDVI 像元的均值，构建作物生长过程曲线，从农作物生长的全过程对作物生长进行描述。通过将当前生长过程与去年、多年平均以及指定某一时期的作物生长曲线进行对比，反映作物生长的状况。
+
+农作物长势实时监测，通过实时NDVI 遥感影像与去年、多年平均以及某一指定时期的遥感影像进行差值运算，并对差值图像进行分级，来反映作物生长差异的空间变化，判断监测期内地块之间作物长势状况。
+
+对，这是地块之间的，还可以同一地块不同月份、同一地块不同年份
+
+
+飘过一朵云:
+对，这是地块之间的
+
+飘过一朵云:
+还可以同一地块不同月份、同一地块不同年份
+
+飘过一朵云:
+可以相对比，也可以绝对比
+
+
+
+
+工作内容包括：
+1. 哨兵图像的下载存储；
+2. GEE处理分析；
+3. 叶龄诊断中遥感反演算法的研发；
+
+
+
+1. 地块级别的长势分布图
+2. 历史长势分布的动态分布图
+3. 时空同环比对比
+4. 长势分类
+5. 输出专题图、数据集及算法（.whl）
+
+zhangzhian123456
+//闫家岗农场行政边界
+var yanjiagang = ee.FeatureCollection('users/zhangzhiancas/res_plot_yjg');
+/*
+var Name_List = ee.List( ['桥南-02','桥南-03'] );
+var Inlist_Filter   = ee.Filter.inList( 'PLOT_NAME', Name_List);//筛选事先构造好的列表中包含的元数据。
+var List_Features   = yanjiagang.filter( Inlist_Filter ); //从一个大区域中筛选多个小区域作为实验区
+print(List_Features);
+*/
+//Map.addLayer(List_Features);
+
+//var yjg02= yanjiagang.filterMetadata('PLOT_NAME','equals','桥南-02').Geometry();
+
+var yjg02 = ee.Feature(
+    yanjiagang.filter(ee.Filter.eq('PLOT_NAME', '桥南-02')).geometry(),
+    {label: '桥南-02', value: 0});
+var yjg03 = ee.Feature(
+    yanjiagang.filter(ee.Filter.eq('PLOT_NAME', '桥南-03')).geometry(),
+    {label: '桥南-03', value: 1});
+var yjg04 = ee.Feature(
+    yanjiagang.filter(ee.Filter.eq('PLOT_NAME', '桥南-04')).geometry(),
+    {label: '桥南-04', value: 2});   
+    
+var yjg234 = ee.FeatureCollection([yjg02, yjg03, yjg04]);
+
+//print(yjg02);
+
+// 筛选时间
+var start_date = ee.Date.fromYMD(2021, 5, 1);
+var end_date = ee.Date.fromYMD(2021, 11, 1);
+
+// 哨兵2的数据
+var s2 = ee.ImageCollection("COPERNICUS/S2_SR");
+
+/*
+// 哨兵2去云
+var s2_rmcloud = function(image) {
+ var quality = image.select("QA60").unmask();  //会将影像的掩膜区域与非掩膜区域用0和1区分开来
+ //，其中1代表为掩膜，0代表未掩膜。
+ return image.updateMask(quality.eq(0)); //updateMask会将影像上为0的区域掩膜掉，
+ 
+};
+*/
+
+//qa.bitwiseAnd(cloudBitMask).eq(0) 表示选择cloudBitMask
+//比特位为10的数据左移一位，并且让bit10位置的值等于0，这样就生成了云掩膜。
+//qa.bitwiseAnd(cirrusBitMask).eq(0) 表示选择 cirrusBitMask 比特位为11的数据左移一位，并且让bit11位置等于0，这样生成了卷云的掩膜。
+
+function s2_rmcloud(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+               .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask);
+}
+
+
+
+// 哨兵2计算ndvi
+var s2_ndvi = function(image) {
+ return image.addBands(image.normalizedDifference(["B8", "B4"]).rename("NDVI"));
+};
+
+//获取感兴趣区域
+var study_s2 = s2.filterDate(start_date, end_date)
+               .filterBounds(yanjiagang)
+var study_s2_nocloud = study_s2.map(s2_rmcloud);
+
+var ndvi = s2_ndvi(study_s2_nocloud.median()).select("NDVI").clip(yanjiagang);
+var ndvi2 = study_s2_nocloud.map(s2_ndvi).select("NDVI");
+print("ndvi2",ndvi2);
+/*
+var yjg02mean = ndvi2.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: yjg02,
+    scale: 30,
+    maxPixels: 1e13
+  });
+
+
+var yjg03mean = ndvi2.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: yjg03,
+    scale: 30,
+    maxPixels: 1e13
+  });
+  
+*/
+
+
+/*
+//另一种方式
+var l8Col = ee.ImageCollection("COPERNICUS/S2_SR")
+              .filterBounds(yanjiagang)
+              .filterDate("2021-5-1", "2021-11-1")
+              .map(function(image) {
+                return image.addBands(image.normalizedDifference(["B8", "B4"]).rename("NDVI"));
+              })
+              .select("NDVI");
+
+//
+*/
+/*
+var visParam = {
+ min: -0.2,
+ max: 0.8,
+ palette: 'FFFFFF, CE7E45, DF923D, F1B555, FCD163, 99B718, 74A901, 66A000, 529400,' +
+   '3E8601, 207401, 056201, 004C00, 023B01, 012E01, 011D01, 011301'
+};
+
+// 绘制NDVI
+Map.addLayer(ndvi, visParam, 'Vegetation');
+
+Map.centerObject(yanjiagang, 12);
+// 这里构建空的Image，然后通过palette设置边界颜色
+var empty = ee.Image().toByte();
+var outline = empty.paint({
+ featureCollection:yanjiagang,  // 筛选的colletion
+ color:0, //颜色透明
+ width:3  //边界宽度
+});
+//绘制红色边界
+Map.addLayer(outline, {palette: "ff0000"}, "outline");
+
+// 绘制默认的行政区划，颜色设置为蓝色，默认图层不显示
+Map.addLayer(yanjiagang, {color:"0000ff"}, "yanjiagang", false);
+
+
+//print(ndvi_clipped);
+//导出到drive里（https://drive.google.com/drive/my-drive）
+Export.image.toDrive({
+  image: ndvi,
+  fileNamePrefix: "yanjiagang_ndvi",
+  //scale:10意思是分辨率10米
+  scale: 10,
+  maxPixels: 1e13
+ 
+});
+*/
+var chart =
+    ui.Chart.image
+        .seriesByRegion({
+          imageCollection: ndvi2,
+          //band: 'NDVI',
+          regions: yjg234,
+          reducer: ee.Reducer.mean(),
+          scale: 30,
+          seriesProperty: 'label',
+          xProperty: 'system:time_start'
+        })
+        .setOptions({
+          title: 'Average NDVI Value by Date',
+          hAxis: {title: 'Date', titleTextStyle: {italic: false, bold: true}},
+          vAxis: {
+            title: 'NDVI',
+            titleTextStyle: {italic: false, bold: true}
+          },
+          lineWidth: 1,
+          pointSize:2,
+          colors: ['f0af07', '0f8755', '76b349'],
+        });
+print(chart);
+
+
+
+ 
+//闫家岗农场行政边界
+var yanjiagang = ee.FeatureCollection('users/zhangzhiancas/res_plot_yjg');
+
+
+/*
+// 哨兵2去云
+var s2_rmcloud = function(image) {
+ var quality = image.select("QA60").unmask();  //会将影像的掩膜区域与非掩膜区域用0和1区分开来
+ //，其中1代表为掩膜，0代表未掩膜。
+ return image.updateMask(quality.eq(0)); //updateMask会将影像上为0的区域掩膜掉，
+ 
+};
+*/
+
+//qa.bitwiseAnd(cloudBitMask).eq(0) 表示选择cloudBitMask
+//比特位为10的数据左移一位，并且让bit10位置的值等于0，这样就生成了云掩膜。
+//qa.bitwiseAnd(cirrusBitMask).eq(0) 表示选择 cirrusBitMask 比特位为11的数据左移一位，并且让bit11位置等于0，这样生成了卷云的掩膜。
+
+function s2_rmcloud(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+               .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask);
+}
+
+//2016-2020NDVI 
+
+/*
+var time = ee.List.sequence(2016,2020)
+var ndvis= time.map(function(year){
+  var datestart = ee.Number(year).format("%04d").cat("-01-01");//拼接字符串
+  var image = ee.ImageCollection("COPERNICUS/S2_SR")
+    .filterBounds(yanjiagang)
+    .filterDate(datestart,ee.Date(datestart).advance(1,"year"))
+    .map(s2_rmcloud)
+    .map(function(image) {
+       return image.addBands(image.normalizedDifference(["B8", "B4"]).rename("NDVI"));
+              })
+            
+    .select("NDVI")
+  return image;
+  });
+
+print (ndvis);
+*/
+/*
+s2_20 = s2_20.map(function(image) {
+  var dict = image.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: yanjiagang,
+    scale: 30,
+    maxPixels: 1e13
+  });
+  dict = ee.Dictionary(dict);
+  var ndvi = ee.Number(dict.get("NDVI"));
+  image = image.set("ndvi", ndvi);
+  return image;
+});
+*/
+var s21 = ee.ImageCollection("COPERNICUS/S2_SR")
+              .filterBounds(yanjiagang)
+              .filterDate("2021-5-1", "2021-11-1")
+              .map(function(image) {
+                return image.addBands(image.normalizedDifference(["B8", "B4"]).rename("NDVI"));
+              })
+              .select("NDVI");
+
+var chart = ui.Chart.image.series({
+                imageCollection: s21,
+                region: yanjiagang,
+                reducer: ee.Reducer.mean(),
+                scale: 30
+                
+              })
+              .setSeriesNames(["NDVI"])
+              .setOptions({
+                title: "NDVI列表", 
+                hAxis: {title: "date",titleTextStyle: {italic: false, bold: true}},
+                vAxis: {title: "ndvi value",titleTextStyle: {italic: false, bold: true}},
+                legend: null,
+                lineWidth:1,
+                pointSize:2
+              });
+print(chart);
+
+var s1720 = ee.ImageCollection("COPERNICUS/S2_SR")
+              .filterBounds(yanjiagang)
+              .filter(ee.Filter.or(//ee.Filter.date('2017-05-01', '2017-11-01'),
+                                   //ee.Filter.date('2018-05-01', '2018-11-01'),
+                                   ee.Filter.date('2019-05-01', '2019-11-01'),
+                                   ee.Filter.date('2020-05-01', '2020-11-01')))
+              .map(function(image) {
+                return image.addBands(image.normalizedDifference(["B8", "B4"]).rename("NDVI"));
+              })
+              .select("NDVI");
+
+
+// Define the chart and print it to the console.
+var chart =
+    ui.Chart.image
+        .doySeries({
+          imageCollection: s1720,
+          region: yanjiagang,
+          regionReducer: ee.Reducer.mean(),
+          scale: 30,
+          yearReducer: ee.Reducer.mean(),
+          startDay: 1,
+          endDay: 365
+        })
+        //.setSeriesNames(['EVI', 'NDVI'])
+        .setOptions({
+          title: 'Average NDVI Value by Day of 2019-2020',
+          hAxis: {
+            title: 'Day of year',
+            titleTextStyle: {italic: false, bold: true}
+          },
+          vAxis: {
+            title: 'NDVI',
+            titleTextStyle: {italic: false, bold: true}
+          },
+          lineWidth: 1,
+          //colors: ['e37d05', '1d6b99'],
+          pointSize:2
+        });
+print(chart);
+
+
+var chart = ui.Chart.image
+                .doySeriesByYear({
+                  imageCollection: s1720,
+                  bandName: 'NDVI',
+                  region: yanjiagang,
+                  regionReducer: ee.Reducer.mean(),
+                  scale: 30,
+                  sameDayReducer: ee.Reducer.mean(),
+                  startDay: 1,
+                  endDay: 365
+                })
+                .setOptions({
+                  title: 'Average NDVI Value by Day of Year',
+                  hAxis: {
+                    title: 'Day of year',
+                    titleTextStyle: {italic: false, bold: true}
+                  },
+                  vAxis: {
+                    title: 'NDVI',
+                    titleTextStyle: {italic: false, bold: true}
+                  },
+                  lineWidth:1,
+                  colors: ['39a8a7', '9c4f97'],
+                  pointSize:2
+                });
+print(chart);
+
+
+
+/*
+// Define the chart and print it to the console.
+var chart = ui.Chart.image
+                .doySeriesByRegion({
+                  imageCollection: yanjiagang,
+                  bandName: 'NDVI',
+                  regions: s2,
+                  regionReducer: ee.Reducer.mean(),
+                  scale: 30,
+                  yearReducer: ee.Reducer.mean(),
+                  seriesProperty: 'label',
+                  startDay: 1,
+                  endDay: 365
+                })
+                .setOptions({
+                  title: 'Average NDVI Value by Day of Year',
+                  hAxis: {
+                    title: 'Day of year',
+                    titleTextStyle: {italic: false, bold: true}
+                  },
+                  vAxis: {
+                    title: 'NDVI (x1e4)',
+                    titleTextStyle: {italic: false, bold: true}
+                  },
+                  lineWidth: 5,
+                  colors: ['f0af07', '0f8755', '76b349'],
+                });
+print(chart);
+*/
+
+
+
+
